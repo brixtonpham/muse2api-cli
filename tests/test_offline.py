@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import muse2api as m  # noqa: E402
+import muse2api  # noqa: E402
+from muse2api import _core as m  # noqa: E402
+from muse2api import client  # noqa: E402
 
 
 class Paths(unittest.TestCase):
@@ -67,6 +69,43 @@ class Events(unittest.TestCase):
         hist = [{"event": "message.assistant", "payload": {"display_text": "Test received"}}]
         self.assertEqual(m.reply_text(live), "hi")
         self.assertEqual(m.reply_text(hist), "Test received")
+
+
+class Library(unittest.TestCase):
+    def test_public_api(self):
+        for name in ("Muse", "Generation", "MediaFile", "Usage", "Store", "MuseError", "LimitReached", "generate",
+                     "accounts", "login_from_file", "login_browser"):
+            self.assertTrue(hasattr(muse2api, name), name)
+
+    def test_store_accounts_and_settings(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            st = muse2api.Store(d)
+            (Path(d) / "zed.json").write_text("[]")
+            st.set_account("main", proxy="http://h:1")
+            st.set_account("ext", cdp="http://127.0.0.1:9222")
+            self.assertEqual(st.accounts(), ["ext", "zed"])  # main has only a proxy, no cookies yet
+            self.assertEqual(st.account_conf("main"), {"proxy": "http://h:1"})
+            self.assertEqual(oct((Path(d) / "accounts.json").stat().st_mode & 0o777), "0o600")
+            with self.assertRaises(muse2api.MuseError):  # cookies without the session cookie
+                st.save_cookies("x", [{"name": "other", "value": "v", "domain": ".muse.ai"}])
+
+    def test_generation_json_shape(self):
+        g = muse2api.Generation(ok=True, media=[muse2api.MediaFile(Path("/o/a.mp4"), 3, "video/mp4", "sandbox://workspace/a.mp4")],
+                                reply="done", thread="https://muse.ai/thread/x",
+                                usage=muse2api.Usage("Free", 36, "Nov 4", 0, "1B"),
+                                usage_before=muse2api.Usage("Free", 33, "Nov 4", 0, "1B"))
+        d = g.to_dict()
+        self.assertEqual(list(d), ["thread", "preamble", "ok", "reply", "media", "usage"])
+        self.assertEqual(d["media"][0]["file"], "/o/a.mp4")
+        self.assertEqual(g.cost_weekly_pct, 3)
+        json.dumps(d)
+
+    def test_thread_id(self):
+        sid = "00000000-0000-4000-8000-000000000000"
+        self.assertEqual(client._thread_id(f"https://muse.ai/thread/{sid}"), sid)
+        with self.assertRaises(muse2api.MuseError):
+            client._thread_id("https://muse.ai/")
 
 
 if __name__ == "__main__":

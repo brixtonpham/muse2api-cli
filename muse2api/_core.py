@@ -1,38 +1,8 @@
-"""Generate videos/images with Muse (muse.ai) from a prompt + reference images, using only a saved cookie file.
-
-usage:
-  python3 muse2api.py login  [--account main] [--from-file cookies.json]   # save the muse.ai cookies once (~30 days)
-  python3 muse2api.py login  --account NAME --browser [--proxy URL]         # a person logs in in a window we open
-  python3 muse2api.py usage  [--account main | --all]                        # weekly % used, reset date, extra tokens
-  python3 muse2api.py get    [--account main] --events turn.json --out DIR    # re-download a saved turn's media
-  python3 muse2api.py gen    [--account main] --prompt "..." --ref a.jpg [--ref ...] --out DIR [--timeout 900]
-        gen prints one JSON line: {"ok", "media": [{"file", "bytes", "mime", "path"}], "reply"}
-        exit 0 = media saved, 2 = Muse answered without media (text in "reply"), 3 = a step failed ("error"),
-        4 = the account is out of quota (weekly limit full, no additional tokens). Every gen logs the account's
-        usage before and after to muse_usage.jsonl, so each video/image's cost in % of the weekly limit is known.
-
-login without --from-file reads the cookies from your own Chrome over CDP (enable it in
-chrome://inspect/#remote-debugging and click Allow); --from-file takes a Cookie-Editor / CDP JSON export.
-login --browser opens a visible Chrome on the account's own profile; the person who owns the account types the
-email and code (the script never types or reads them), and once the composer loads it saves the cookies and closes.
-Cookies live in ~/.config/muse2api/<account>.json (mode 600) and are written back after every run,
-so the rolling session (hatch_sess, ~30 days) stays fresh. Each account also keeps one Chrome profile
-(~/.config/muse2api/profiles/<account>/), so Muse sees the same device on every run, and an optional fixed proxy
-(~/.config/muse2api/accounts.json, set by `login --proxy`, used by login and every later run). One run per account
-at a time: Chrome locks the profile. An account can instead attach to a browser you run yourself (any Chrome-based
-browser with a CDP endpoint): see "cdp" in accounts.json.
-
-How gen works: Muse gives each account one agent VM reached over an encrypted WebSocket, so there is no
-plain HTTP API. The script starts its own headless Chrome with the saved cookies and opens muse.ai. It sends the
-prompt through the page's own gateway client (`chat.stream`), waits for the turn's `delta.presentation` media and
-saves each file with `fs.raw`, checking its byte size against the event's byte_len. When the gateway client cannot be
-found it falls back to the page itself: typing in the composer, reading the decrypted events from a JSON.parse
-hook, and the message's Download button.
-"""
-import argparse
+"""Low-level driver: a browser on muse.ai, the page's gateway calls and the DOM fallbacks. Use muse2api.Muse."""
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -48,6 +18,9 @@ from urllib.request import urlopen
 
 import websockets
 
+logger = logging.getLogger("muse2api")
+
+
 def _chrome():
     """MUSE2API_CHROME, else the usual install path for this OS, else chrome/chromium on PATH."""
     if env := os.environ.get("MUSE2API_CHROME"):
@@ -62,14 +35,6 @@ def _chrome():
 
 CHROME = _chrome()
 MUSE = "https://muse.ai/"
-CONF = Path(os.environ.get("MUSE2API_HOME") or Path.home() / ".config" / "muse2api")
-PROFILES = CONF / "profiles"
-# {account: {"proxy": "http://user:pass@host:port"}} for our own Chrome, or an external browser:
-# {account: {"cdp": "http://127.0.0.1:9222"}} (or a ws:// URL), or {"cdp_cmd": [...]} printing that URL or {"ws": ...},
-# with optional "open_cmd" / "close_cmd" run before and after. Mode 600.
-ACCOUNTS = CONF / "accounts.json"
-# per-account quota readings, no secrets; MUSE2API_USAGE_LOG overrides the default
-USAGE_LOG = Path(os.environ.get("MUSE2API_USAGE_LOG") or CONF / "usage.jsonl")
 def _ua():
     """The installed Chrome's own user agent, without "Headless" (a hard-coded version went stale on 156)."""
     try:
@@ -112,12 +77,7 @@ class LimitReached(MuseError):
 
 
 def log(*a):
-    print(time.strftime("%H:%M:%S ") + " ".join(str(x) for x in a), file=sys.stderr, flush=True)
-
-
-# ---------------- cookies ----------------
-def cookie_path(account):
-    return CONF / f"{account}.json"
+    logger.info(" ".join(str(x) for x in a))
 
 
 def normalize(cookies):
@@ -136,29 +96,54 @@ def normalize(cookies):
     return out
 
 
-def save_cookies(account, cookies):
-    CONF.mkdir(parents=True, exist_ok=True)
-    path = cookie_path(account)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cookies))
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    names = {c["name"] for c in cookies}
-    if "hatch_sess" not in names:
-        raise MuseError(f"saved {len(cookies)} cookies but no hatch_sess: not logged in to muse.ai")
-    exp = next(c.get("expires", 0) for c in cookies if c["name"] == "hatch_sess")
-    log(f"saved {len(cookies)} cookies to {path}; hatch_sess expires {time.strftime('%Y-%m-%d', time.localtime(exp))}")
+class Store:
+    """The account files under one folder (default $MUSE2API_HOME or ~/.config/muse2api):
 
+    - <account>.json: the account's muse.ai cookies (mode 600), written back after every run
+    - profiles/<account>/: its own Chrome profile, so Muse sees the same device every run
+    - accounts.json (mode 600): per-account settings. {"proxy": "scheme://[user:pass@]host:port"} for our own Chrome,
+      or an external browser: {"cdp": "http://127.0.0.1:9222" | "ws://..."} or {"cdp_cmd": [...]} printing that URL
+      or {"ws": ...}, with optional "open_cmd" / "close_cmd" run before and after.
+    """
 
-def account_conf(account):
-    return json.loads(ACCOUNTS.read_text()).get(account, {}) if ACCOUNTS.exists() else {}
+    def __init__(self, home=None):
+        self.home = Path(home or os.environ.get("MUSE2API_HOME") or Path.home() / ".config" / "muse2api")
+        self.accounts_file = self.home / "accounts.json"
 
+    def cookie_path(self, account):
+        return self.home / f"{account}.json"
 
-def all_accounts():
-    """Every usable account, main first: a saved cookie file, or an external browser in accounts.json."""
-    conf = json.loads(ACCOUNTS.read_text()) if ACCOUNTS.exists() else {}
-    names = {p.stem for p in CONF.glob("*.json") if p != ACCOUNTS} | {k for k, v in conf.items() if external(v)}
-    return sorted(names, key=lambda x: (x != "main", x))
+    def _conf(self):
+        return json.loads(self.accounts_file.read_text()) if self.accounts_file.exists() else {}
+
+    def account_conf(self, account):
+        return self._conf().get(account, {})
+
+    def accounts(self):
+        """Every usable account, main first: a saved cookie file, or an external browser in accounts.json."""
+        names = {p.stem for p in self.home.glob("*.json") if p != self.accounts_file}
+        return sorted(names | {k for k, v in self._conf().items() if external(v)}, key=lambda x: (x != "main", x))
+
+    def save_cookies(self, account, cookies):
+        self.home.mkdir(parents=True, exist_ok=True)
+        path = self.cookie_path(account)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cookies))
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        names = {c["name"] for c in cookies}
+        if "hatch_sess" not in names:
+            raise MuseError(f"saved {len(cookies)} cookies but no hatch_sess: not logged in to muse.ai")
+        exp = next(c.get("expires", 0) for c in cookies if c["name"] == "hatch_sess")
+        log(f"saved {len(cookies)} cookies to {path}; hatch_sess expires {time.strftime('%Y-%m-%d', time.localtime(exp))}")
+
+    def set_account(self, account, **settings):
+        """Merge settings (e.g. proxy=..., cdp=...) into the account's entry in accounts.json."""
+        self.home.mkdir(parents=True, exist_ok=True)
+        conf = self._conf()
+        conf.setdefault(account, {}).update(settings)
+        self.accounts_file.write_text(json.dumps(conf, indent=1))
+        os.chmod(self.accounts_file, 0o600)
 
 
 def external(conf):
@@ -166,10 +151,10 @@ def external(conf):
     return bool(conf.get("cdp") or conf.get("cdp_cmd"))
 
 
-def run_cmd(cmd):
+def run_cmd(cmd, lock_dir):
     """An account's open/close/cdp command. One at a time across runs: browser managers often break under parallel calls."""
-    CONF.mkdir(parents=True, exist_ok=True)
-    with open(CONF / "cmd.lock", "w") as lk:
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_dir / "cmd.lock", "w") as lk:
         if os.name != "nt":
             import fcntl
             fcntl.flock(lk, fcntl.LOCK_EX)
@@ -188,14 +173,6 @@ def ws_url(endpoint):
         return endpoint
     with urlopen(endpoint.rstrip("/") + "/json/version", timeout=10) as r:
         return json.loads(r.read())["webSocketDebuggerUrl"]
-
-
-def set_proxy(account, proxy):
-    CONF.mkdir(parents=True, exist_ok=True)
-    conf = json.loads(ACCOUNTS.read_text()) if ACCOUNTS.exists() else {}
-    conf.setdefault(account, {})["proxy"] = proxy
-    ACCOUNTS.write_text(json.dumps(conf, indent=1))
-    os.chmod(ACCOUNTS, 0o600)
 
 
 def chrome_user_dir():
@@ -253,15 +230,15 @@ class Browser:
         self.ws = await websockets.connect(ver["webSocketDebuggerUrl"], max_size=None)
         self.reader = asyncio.create_task(self._read())
 
-    async def attach(self, conf):
+    async def attach(self, conf, lock_dir):
         """A browser someone else runs (a profile manager, your own Chrome with --remote-debugging-port): its
         profile, proxy and cookies stay its own. Runs "open_cmd" if set, then connects to its CDP endpoint."""
-        self.ext, self.temp = conf, False
+        self.ext, self.lock_dir, self.temp = conf, lock_dir, False
         if conf.get("open_cmd"):
-            run_cmd(conf["open_cmd"])
+            run_cmd(conf["open_cmd"], lock_dir)
         for _ in range(30):
             try:
-                ws = ws_url(run_cmd(conf["cdp_cmd"]) if conf.get("cdp_cmd") else conf["cdp"])
+                ws = ws_url(run_cmd(conf["cdp_cmd"], lock_dir) if conf.get("cdp_cmd") else conf["cdp"])
                 break
             except (MuseError, OSError, ValueError, KeyError):
                 await asyncio.sleep(1)
@@ -314,7 +291,7 @@ class Browser:
         finally:
             if getattr(self, "ext", None) and self.ext.get("close_cmd"):  # its session and cookies are kept
                 try:
-                    run_cmd(self.ext["close_cmd"])
+                    run_cmd(self.ext["close_cmd"], self.lock_dir)
                 except MuseError as e:
                     log(f"close_cmd: {e}")
             if self.proc:
@@ -327,9 +304,11 @@ class Browser:
                 shutil.rmtree(self.profile, ignore_errors=True)
 
 
-class Muse:
-    def __init__(self, account, headless=True):
-        self.account, self.headless, self.b = account, headless, Browser()
+class Page:
+    """One muse.ai tab for one account: the low-level driver behind muse2api.Muse."""
+
+    def __init__(self, account, store, headless=True):
+        self.account, self.store, self.headless, self.b = account, store, headless, Browser()
         self.api = False  # True: send through the page's gateway (chat.stream) instead of typing in the composer
         self.chat_sid = None  # side chat the API send went to; its turn is read from chat.history, not live events
 
@@ -342,14 +321,14 @@ class Muse:
 
     async def open(self, login_wait=0):
         """login_wait > 0: a person logs in in the (visible) window; wait up to that many seconds for the composer."""
-        conf = account_conf(self.account)
-        path, ext = cookie_path(self.account), external(conf)
+        conf = self.store.account_conf(self.account)
+        path, ext = self.store.cookie_path(self.account), external(conf)
         if ext:  # the browser is logged in already; no cookie file, proxy or user agent of ours
-            await self.b.attach(conf)
+            await self.b.attach(conf, self.store.home)
         else:
             if not path.exists() and not login_wait:
-                raise MuseError(f"no cookies for account '{self.account}': run `muse2api.py login` first")
-            await self.b.start(PROFILES / self.account, self.headless, account_conf(self.account).get("proxy"))
+                raise MuseError(f"no cookies for account '{self.account}': log in first (`muse2api login`)")
+            await self.b.start(self.store.home / "profiles" / self.account, self.headless, conf.get("proxy"))
             if path.exists():
                 await self.b.call("Storage.setCookies", {"cookies": normalize(json.loads(path.read_text()))})
         t = await self.b.call("Target.createTarget", {"url": "about:blank"})
@@ -373,7 +352,7 @@ class Muse:
                 pass
         else:
             url = await self.js("location.href")
-            raise MuseError(f"composer did not load at {url}: cookies expired? run `muse2api.py login` again")
+            raise MuseError(f"composer did not load at {url}: cookies expired? log in again (`muse2api login`)")
         await asyncio.sleep(2)
 
     async def new_side_chat(self):
@@ -693,7 +672,7 @@ class Muse:
                 ck = (await self.b.call("Storage.getCookies"))["cookies"]
                 ck = [c for c in ck if c["domain"].endswith("muse.ai")]
                 if any(c["name"] == "hatch_sess" for c in ck):
-                    save_cookies(self.account, ck)
+                    self.store.save_cookies(self.account, ck)
         except Exception as e:
             log(f"cookie write-back skipped: {e}")
         await self.b.stop()
@@ -719,11 +698,6 @@ def exhausted(u):
     """No room left: weekly limit full and no additional tokens (or none left)."""
     extra_empty = u["extra_left"] in (None, "0") or (u["extra_pct"] or 0) >= 100
     return u["weekly_pct"] >= 100 and extra_empty
-
-
-def log_usage(row):
-    with open(USAGE_LOG, "a") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def media(evs):
@@ -771,182 +745,3 @@ def ram_used_pct():
         return round(100 * (total - avail) / total)
     except (OSError, KeyError, ValueError):
         return 0
-
-
-async def browser_login(a):
-    """Visible Chrome on the account's own profile and proxy; the composer loading means the person logged in.
-    close() then saves the session cookies, and every later run reuses this profile."""
-    m = Muse(a.account, headless=False)
-    try:
-        await m.open(login_wait=a.wait)
-        log(f"logged in: account '{a.account}'")
-        return 0
-    except (MuseError, asyncio.TimeoutError) as e:
-        log(f"login failed: {e}")
-        return 3
-    finally:
-        await m.close()
-
-
-async def usage_cmd(a):
-    accounts = all_accounts() if a.all else [a.account]
-    out = {}
-    for acc in accounts:
-        m = Muse(acc)
-        try:
-            await m.open()
-            u = await m.usage()
-            log_usage({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "account": acc, "at": "check", **u})
-            out[acc] = {**u, "exhausted": exhausted(u)}
-        except (MuseError, asyncio.TimeoutError) as e:
-            out[acc] = {"error": str(e)}
-        finally:
-            await m.close()
-    print(json.dumps(out, ensure_ascii=False))
-    return 0
-
-
-async def get(a):
-    """Re-download the media of a turn saved with `gen --events` (recovery after a failed download)."""
-    m, res, code = Muse(a.account), {}, 0
-    try:
-        await m.open()
-        if a.thread:  # a side chat: the turn's media only render in its own thread
-            await m.b.call("Page.navigate", {"url": a.thread}, m.sid)
-            await asyncio.sleep(10)
-        await asyncio.sleep(5)  # let the chat history render
-        res = {"ok": True, "media": [await m.download(i, a.out) for i in media(json.loads(Path(a.events).read_text()))]}
-    except (MuseError, asyncio.TimeoutError) as e:
-        res, code = {"ok": False, "error": str(e) or type(e).__name__}, 3
-    finally:
-        await m.close()
-    print(json.dumps(res, ensure_ascii=False))
-    return code
-
-
-async def gen(a):
-    m, res, code = Muse(a.account), {}, 0
-    try:
-        await m.open()
-        before = await m.usage()
-        log_usage({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "account": a.account, "at": "before", **before})
-        if exhausted(before):
-            raise LimitReached(f"account '{a.account}' is out of quota: {before}")
-        if a.thread and not re.search(r"/thread/[0-9a-f-]{36}", a.thread):
-            raise MuseError(f"not a chat id: {a.thread}")
-        m.api = await m.api_ready([p.resolve() for p in a.ref + a.preamble_ref])
-        log("send: " + ("chat.stream (api)" if m.api else "composer (DOM)"))
-        if a.thread:  # continue an earlier side chat (e.g. part 2 of a longer video)
-            await m.b.call("Page.navigate", {"url": a.thread}, m.sid)
-            for _ in range(30):
-                await asyncio.sleep(1)
-                if await m.js("(()=>{const t=document.querySelector('textarea');return !!t&&!t.disabled})()"):
-                    break
-            else:
-                raise MuseError(f"thread did not load: {a.thread}")
-            await asyncio.sleep(3)
-            res["thread"] = a.thread
-            if m.api:
-                m.chat_sid = re.search(r"/thread/([0-9a-f-]{36})", a.thread).group(1)
-        elif not a.main_chat:
-            res["thread"] = m.new_api_thread() if m.api else await m.new_side_chat()
-        res["preamble"] = []
-        for i, text in enumerate(a.preamble):  # earlier turns in the same chat: context before the generation ask
-            await m.send(text, [p.resolve() for p in a.preamble_ref] if i == 0 else [])
-            _, said, _ = await m.wait(min(a.timeout, 300))
-            log(f"preamble {i + 1}: {said[:300]!r}")
-            res["preamble"].append(said)
-        await m.send(a.prompt, [p.resolve() for p in a.ref])
-        items, reply, evs = await m.wait(a.timeout)
-        url = await m.js("location.href")  # a new side chat is /thread/new until its first message: keep the real id
-        if re.search(r"/thread/[0-9a-f-]{36}", url):
-            res["thread"] = url
-            if items:  # 2026-10-27: a chat opened as /thread/new does not render its media until reloaded
-                await m.b.call("Page.navigate", {"url": url}, m.sid)
-                await asyncio.sleep(12)
-        if a.events:
-            Path(a.events).write_text(json.dumps(evs, ensure_ascii=False))
-        res.update({"ok": bool(items), "reply": reply, "media": [await m.download(i, a.out) for i in items]})
-        after = await m.usage()
-        kinds = [str(i.get("mime", "")).split("/")[0] for i in items]
-        log_usage({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "account": a.account, "at": "after", **after,
-                   "videos": kinds.count("video"), "images": kinds.count("image"),
-                   "cost_weekly_pct": after["weekly_pct"] - before["weekly_pct"],
-                   "cost_extra_pct": (after["extra_pct"] or 0) - (before["extra_pct"] or 0)})
-        res["usage"] = after
-        code = 0 if items else 2
-    except LimitReached as e:
-        res, code = {"ok": False, "error": str(e), "limit": True}, 4
-    except (MuseError, asyncio.TimeoutError) as e:
-        res, code = {"ok": False, "error": str(e) or type(e).__name__, "preamble": res.get("preamble", []),
-                     "thread": res.get("thread")}, 3
-        if a.events and getattr(m, "last_events", None):
-            Path(a.events).write_text(json.dumps(m.last_events, ensure_ascii=False))
-    finally:
-        await m.close()
-    print(json.dumps(res, ensure_ascii=False))
-    return code
-
-
-def main():
-    import signal  # a killed run (SIGTERM) still closes its Chrome: the profile stays locked otherwise
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-    ap = argparse.ArgumentParser()
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    lg = sub.add_parser("login")
-    lg.add_argument("--account", default="main")
-    lg.add_argument("--from-file", type=Path)
-    lg.add_argument("--browser", action="store_true", help="open a Chrome window on the account's profile; "
-                    "the account owner logs in there")
-    lg.add_argument("--proxy", help="fixed proxy for this account, scheme://[user:pass@]host:port; kept for every run")
-    lg.add_argument("--wait", type=int, default=900, help="seconds to wait for the login (--browser)")
-    g = sub.add_parser("gen")
-    g.add_argument("--account", default="main")
-    g.add_argument("--prompt", required=True)
-    g.add_argument("--ref", action="append", default=[], type=Path)
-    g.add_argument("--out", required=True, type=Path)
-    g.add_argument("--timeout", type=int, default=900)
-    g.add_argument("--events", help="write the turn's raw chat events to this JSON file")
-    g.add_argument("--main-chat", action="store_true", help="send in the main chat instead of a new side chat")
-    g.add_argument("--thread", help="send in this existing side chat (URL from an earlier gen's \"thread\")")
-    g.add_argument("--preamble", action="append", default=[], help="a message sent (and answered) before the prompt "
-                   "in the same chat; repeatable")
-    g.add_argument("--preamble-ref", action="append", default=[], type=Path, help="image attached to the first preamble")
-    us = sub.add_parser("usage")
-    us.add_argument("--account", default="main")
-    us.add_argument("--all", action="store_true", help="every saved account")
-    gt = sub.add_parser("get")
-    gt.add_argument("--account", default="main")
-    gt.add_argument("--events", required=True)
-    gt.add_argument("--out", required=True, type=Path)
-    gt.add_argument("--thread", help="the side chat URL the turn ran in (gen prints it as \"thread\")")
-    a = ap.parse_args()
-
-    if a.cmd == "login" and a.proxy:
-        set_proxy(a.account, a.proxy)
-    if a.cmd == "login" and a.browser:
-        sys.exit(asyncio.run(browser_login(a)))
-    if a.cmd == "login":
-        raw = json.loads(a.from_file.read_text()) if a.from_file else asyncio.run(cookies_from_chrome())
-        try:
-            save_cookies(a.account, normalize(raw))
-        except MuseError as e:
-            sys.exit(str(e))
-        return
-    if a.cmd == "usage":
-        sys.exit(asyncio.run(usage_cmd(a)))
-    if a.cmd == "get":
-        a.out.mkdir(parents=True, exist_ok=True)
-        sys.exit(asyncio.run(get(a)))
-    for p in a.ref + a.preamble_ref:
-        if not p.is_file():
-            sys.exit(f"ref not found: {p}")
-    a.out.mkdir(parents=True, exist_ok=True)
-    limit = int(os.environ.get("MUSE2API_MAX_RAM", "80"))  # headless Chrome is heavy: don't start on a full machine
-    if (used := ram_used_pct()) >= limit:
-        sys.exit(f"RAM {used}% used (limit {limit}%, MUSE2API_MAX_RAM); not starting")
-    sys.exit(asyncio.run(gen(a)))
-
-
-if __name__ == "__main__":
-    main()

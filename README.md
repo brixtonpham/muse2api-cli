@@ -1,6 +1,7 @@
 # muse2api
 
-Generate videos and images with [Muse](https://muse.ai) from a prompt plus reference images, from the command line.
+Generate videos and images with [Muse](https://muse.ai) from a prompt plus reference images, from Python or the
+command line.
 
 > **Unofficial.** Not affiliated with or endorsed by Meta or Muse. There is no public Muse API: this tool drives the
 > muse.ai web app in a browser you are logged in to. Automating a web app may break its terms of service and can get
@@ -13,18 +14,53 @@ Generate videos and images with [Muse](https://muse.ai) from a prompt plus refer
 - Python 3.11+
 
 ```bash
-pip install -r requirements.txt          # or: pipx install .
+pip install git+https://github.com/brixtonpham/muse2api-cli     # library + the `muse2api` command
 ```
 
-## Usage
+## Library
+
+```python
+import asyncio
+import muse2api
+
+async def main():
+    async with muse2api.Muse("main") as m:          # one account, one browser
+        print(await m.usage())                         # Usage(plan='Free', weekly_pct=33, ...)
+        g = await m.generate("a 10 s video of a cat surfing", refs=["cat.jpg"], out="out/")
+        if g.ok:
+            print([f.file for f in g.media], g.cost_weekly_pct)
+        else:
+            print("no media:", g.reply)                # usually a question or a refusal
+
+asyncio.run(main())
+```
+
+| API | what it does |
+|---|---|
+| `Muse(account, home=None, headless=True, usage_log=None)` | an account, as `async with`; `usage_log` appends each usage reading to a JSONL file |
+| `await m.generate(prompt, refs, out, timeout=900, thread=None, new_chat=True, preamble=(), preamble_refs=())` | send, wait, save every file → `Generation(ok, media, reply, thread, usage, usage_before, events)` |
+| `await m.start_chat(refs=(), thread=None, new_chat=True)` then `await m.send(text, refs)` | lower level: pick a chat, send one message → `Turn(reply, items, thread, events)` |
+| `await m.download(item_or_path, out)` | save one file by its event item or a `sandbox://workspace/...` path → `MediaFile(file, bytes, mime, path)` |
+| `await m.download_turn(events, out)` | re-download every file of a saved turn (`Generation.events` or a JSON file) |
+| `await m.usage()` | `Usage(plan, weekly_pct, resets, extra_pct, extra_left)`, `.exhausted` |
+| `muse2api.generate(prompt, refs, out, account="main")` | blocking shortcut for scripts |
+| `login_from_chrome(account)`, `login_from_file(account, path)`, `login_browser(account, proxy=None)`, `accounts()` | account setup |
+
+Errors: `LimitReached` (out of quota) and `MuseError` (a step failed; `.thread`, `.preamble`, `.events` hold what was
+done). `generate` never resends on its own: a retry could start a second paid generation. Progress is logged on the
+`muse2api` logger.
+
+## Command line
 
 ```bash
-python3 muse2api.py login  [--account main] [--from-file cookies.json]   # save the muse.ai cookies (~30 days)
-python3 muse2api.py login  --account NAME --browser [--proxy URL]         # you log in, in a window it opens
-python3 muse2api.py gen    [--account main] --prompt "..." --ref a.jpg [--ref ...] --out DIR [--timeout 900]
-python3 muse2api.py get    [--account main] --events turn.json --out DIR  # re-download a saved turn's media
-python3 muse2api.py usage  [--account main | --all]                       # weekly % used, reset date
+muse2api login  [--account main] [--from-file cookies.json]   # save the muse.ai cookies (~30 days)
+muse2api login  --account NAME --browser [--proxy URL]         # you log in, in a window it opens
+muse2api gen    [--account main] --prompt "..." --ref a.jpg [--ref ...] --out DIR [--timeout 900]
+muse2api get    [--account main] --events turn.json --out DIR  # re-download a saved turn's media
+muse2api usage  [--account main | --all]                       # weekly % used, reset date
 ```
+
+`python3 -m muse2api ...` works too, and `--home DIR` picks another account folder.
 
 `gen` also takes `--preamble TEXT` (repeatable, answered in the same chat before the prompt), `--preamble-ref IMG`,
 `--events FILE` (save the turn's raw events, for `get`), `--thread URL` (continue a chat) and `--main-chat`
@@ -66,14 +102,14 @@ Everything lives in `~/.config/muse2api/` (or `$MUSE2API_HOME`).
   `cdp` is an `http://host:port` or `ws://` URL; `cdp_cmd` prints one of those, or JSON `{"ws": "ws://..."}`. The
   commands run one at a time across parallel runs.
 
-Every `gen` logs the account's usage before and after to `usage.jsonl` (or `$MUSE2API_USAGE_LOG`), so each file's cost
-in % of the weekly limit is known. A run will not start while system RAM use is at or above 80 %
-(`MUSE2API_MAX_RAM`).
+The command logs every usage reading to `usage.jsonl` there (or `$MUSE2API_USAGE_LOG`), so each file's cost in % of
+the weekly limit is known, and `gen` will not start while system RAM use is at or above 80 % (`MUSE2API_MAX_RAM`).
+The library does neither unless you ask (`usage_log=`).
 
 ## How it works
 
 Muse gives each account an agent VM reached over an encrypted WebSocket, so there is no plain HTTP API. The page
-holds a gateway client that sends RPC calls to that VM over the socket. The script opens muse.ai in a browser, finds
+holds a gateway client that sends RPC calls to that VM over the socket. It opens muse.ai in a browser, finds
 that client in the page, and uses the same calls the web app does:
 
 | call | used for |
@@ -83,7 +119,7 @@ that client in the page, and uses the same calls the web app does:
 | `fs.raw` | download a generated file by its `sandbox://workspace/...` path, byte for byte |
 
 Each saved file's size is checked against the `byte_len` in the event. If the gateway client cannot be found, the
-script falls back to the page itself: it types in the composer, reads the decrypted events through a `JSON.parse`
+library falls back to the page itself: it types in the composer, reads the decrypted events through a `JSON.parse`
 hook, and clicks the message's Download button.
 
 Reference images go through the composer by default. `MUSE2API_API_REFS=1` sends them inline with `chat.stream`

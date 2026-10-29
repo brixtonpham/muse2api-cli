@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "muse2api"
-version = "0.1.0"
-description = "Unofficial command line for generating Muse (muse.ai) videos and images"
+version = "0.2.0"
+description = "Unofficial Python library and command line for generating Muse (muse.ai) videos and images"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = ["websockets>=16"]
 
 [project.scripts]
-muse2api = "muse2api:main"
+muse2api = "muse2api.cli:run"
 
 [tool.setuptools]
-py-modules = ["muse2api"]
+packages = ["muse2api"]
